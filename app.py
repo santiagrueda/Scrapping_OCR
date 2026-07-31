@@ -24,7 +24,7 @@ import json
 import shutil
 import string
 from collections import Counter
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 
 import requests
 import numpy as np
@@ -186,6 +186,24 @@ def groq_text_call(api_key: str, model: str, system_prompt: str, user_prompt: st
 # ------------------------------------------------------------------------------------
 # 3. WEB SCRAPING (fuentes libres, sin API key)
 # ------------------------------------------------------------------------------------
+def resolve_ddg_url(href: str) -> str:
+    """DuckDuckGo HTML (versión sin JS) a veces no devuelve el link directo sino
+    un enlace de redirección propio, del tipo //duckduckgo.com/l/?uddg=<url_real>&rut=...
+    Esta función detecta ese patrón y devuelve la URL real (decodificada), para que
+    el dominio calculado más adelante (columna 'dominio') refleje la fuente real y
+    no siempre 'duckduckgo.com'. Si el href ya es un link directo, se devuelve tal cual."""
+    if not href:
+        return href
+    absolute = href if href.startswith("http") else f"https:{href}"
+    parsed = urlparse(absolute)
+    if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
+        qs = parse_qs(parsed.query)
+        real_url = qs.get("uddg", [None])[0]
+        if real_url:
+            return unquote(real_url)
+    return absolute
+
+
 def scrape_duckduckgo(query: str, max_results: int = 8) -> list:
     """Scrapea resultados de DuckDuckGo HTML (versión sin JS), de acceso libre."""
     url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
@@ -201,7 +219,7 @@ def scrape_duckduckgo(query: str, max_results: int = 8) -> list:
             if not title_tag:
                 continue
             title = title_tag.get_text(strip=True)
-            link = title_tag.get("href", "")
+            link = resolve_ddg_url(title_tag.get("href", ""))
             snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
             results.append({
                 "query": query,
@@ -246,6 +264,7 @@ def scrape_wikipedia(query: str) -> list:
     return results
 
 
+@st.cache_data(show_spinner=False, ttl=1800)
 def run_scraping(queries: list, max_results_per_query: int = 6) -> pd.DataFrame:
     all_rows = []
     progress = st.progress(0.0, text="Iniciando scraping...")
@@ -274,6 +293,7 @@ def clean_tokenize(text: str) -> list:
     return tokens
 
 
+@st.cache_data(show_spinner=False)
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     fdf = df.copy()
     fdf["snippet"] = fdf["snippet"].fillna("")
@@ -303,6 +323,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return fdf
 
 
+@st.cache_data(show_spinner=False)
 def top_keywords(corpus: list, top_n: int = 20) -> pd.DataFrame:
     all_tokens = []
     for text in corpus:
@@ -310,6 +331,18 @@ def top_keywords(corpus: list, top_n: int = 20) -> pd.DataFrame:
     counts = Counter(all_tokens)
     common = counts.most_common(top_n)
     return pd.DataFrame(common, columns=["palabra", "frecuencia"])
+
+
+@st.cache_data(show_spinner=False)
+def build_wordcloud_image(corpus: list):
+    """Genera la nube de palabras a partir del corpus. Cacheada porque generar el
+    WordCloud es la parte más costosa del EDA y antes se recalculaba en cada
+    rerun de Streamlit (cualquier clic en la app), no solo cuando cambiaban
+    los datos scrapeados. Devuelve None si no hay tokens suficientes."""
+    tokens = clean_tokenize(" ".join(corpus))
+    if not tokens:
+        return None
+    return WordCloud(width=900, height=400, background_color="white").generate(" ".join(tokens))
 
 
 # ------------------------------------------------------------------------------------
@@ -493,14 +526,14 @@ with tab3:
         st.plotly_chart(fig3, use_container_width=True)
 
         st.markdown("#### Nube de palabras")
-        all_text = " ".join(df["snippet"].fillna("").tolist() + df["titulo"].fillna("").tolist())
-        tokens = clean_tokenize(all_text)
-        if tokens:
-            wc = WordCloud(width=900, height=400, background_color="white").generate(" ".join(tokens))
+        corpus = df["snippet"].fillna("").tolist() + df["titulo"].fillna("").tolist()
+        wc = build_wordcloud_image(corpus)
+        if wc is not None:
             fig_wc, ax_wc = plt.subplots(figsize=(10, 4))
             ax_wc.imshow(wc, interpolation="bilinear")
             ax_wc.axis("off")
             st.pyplot(fig_wc)
+            plt.close(fig_wc)  # evita acumular figuras de matplotlib en memoria entre reruns
         else:
             st.info("No hay suficiente texto para generar la nube de palabras.")
 
@@ -545,6 +578,7 @@ with tab4:
                 fig, ax = plt.subplots(figsize=(8, 6))
                 sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", ax=ax)
                 st.pyplot(fig)
+                plt.close(fig)  # evita acumular figuras de matplotlib en memoria entre reruns
 
             st.markdown("#### Proporción de resultados con precio detectado")
             if "tiene_precio" in fdf.columns:
